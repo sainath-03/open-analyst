@@ -1,0 +1,10 @@
+[
+ {"q": "How many orders are there in total?", "gold": "SELECT COUNT(*) FROM orders"},
+ {"q": "How many orders were delivered?", "gold": "SELECT COUNT(*) FROM orders WHERE order_status = 'delivered'"},
+ {"q": "What is the total GMV?", "gold": "SELECT SUM(price) FROM order_items"},
+ {"q": "Top 5 product categories by GMV in English", "gold": "SELECT pc.product_category_name_english, SUM(oi.price) g FROM order_items oi JOIN products p ON p.product_id=oi.product_id JOIN product_categories pc ON pc.product_category_name=p.product_category_name GROUP BY 1 ORDER BY g DESC LIMIT 5"},
+ {"q": "What is the average review score?", "gold": "SELECT AVG(review_score) FROM order_reviews"},
+ {"q": "How many unique customers are there?", "gold": "SELECT COUNT(DISTINCT customer_unique_id) FROM customers"},
+ {"q": "How many sellers are in each state?", "gold": "SELECT seller_state, COUNT(DISTINCT seller_id) FROM sellers GROUP BY 1"},
+ {"q": "What is the most used payment type by total payment value?", "gold": "SELECT payment_type FROM order_payments GROUP BY 1 ORDER BY SUM(payment_value) DESC LIMIT 1"}
+]

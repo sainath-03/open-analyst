@@ -1,0 +1,530 @@
+# =============================================================================
+# Semantic view: Brazilian E-commerce (Olist)
+#
+# Structure follows the Snowflake semantic view YAML specification:
+#   tables -> dimensions / time_dimensions / facts / metrics / filters
+#   relationships, verified_queries, module_custom_instructions
+#
+# Physical layer: PostgreSQL database `olist`, schema `public`.
+# Logical names are kept identical to the physical column names so that every
+# verified query below runs directly on Postgres (no name-mapping step needed).
+#
+# Not modelled on purpose:
+#   - geolocation: zip prefixes repeat (no unique key), so it can't be joined
+#     safely. Use customer_state / customer_city instead.
+#   - product_name_lenght / product_description_lenght / photo counts: no
+#     business value for analytics questions.
+# =============================================================================
+
+name: olist_ecommerce
+description: >
+  Orders placed on the Olist marketplace in Brazil between September 2016 and
+  October 2018. Covers customers, orders, the products and sellers in each order,
+  payments and customer reviews. Currency is Brazilian real (BRL).
+
+tables:
+
+  # ---------------------------------------------------------------------------
+  - name: orders
+    description: One row per order. Central table; most questions start here.
+    synonyms: [purchases, sales orders]
+    base_table: {database: olist, schema: public, table: orders}
+    primary_key: {columns: [order_id]}
+    dimensions:
+      - name: order_id
+        expr: order_id
+        data_type: TEXT
+        description: Unique order identifier.
+      - name: customer_id
+        expr: customer_id
+        data_type: TEXT
+        description: >
+          Customer key for THIS order. A new customer_id is created for every order,
+          so it can't be used to count unique customers; use customers.customer_unique_id.
+      - name: order_status
+        expr: order_status
+        data_type: TEXT
+        description: Current status of the order.
+        synonyms: [status, order state]
+        sample_values: [delivered, shipped, canceled, unavailable, invoiced, processing, created, approved]
+        is_enum: true
+    time_dimensions:
+      - name: order_purchase_timestamp
+        expr: order_purchase_timestamp
+        data_type: TIMESTAMP
+        description: When the customer placed the order. Default date for "when" questions.
+        synonyms: [order date, purchase date, ordered on]
+      - name: order_approved_at
+        expr: order_approved_at
+        data_type: TIMESTAMP
+        description: When payment was approved.
+      - name: order_delivered_carrier_date
+        expr: order_delivered_carrier_date
+        data_type: TIMESTAMP
+        description: When the seller handed the order to the logistics partner.
+        synonyms: [shipped date]
+      - name: order_delivered_customer_date
+        expr: order_delivered_customer_date
+        data_type: TIMESTAMP
+        description: When the customer actually received the order. NULL if not delivered.
+        synonyms: [delivery date, received date]
+      - name: order_estimated_delivery_date
+        expr: order_estimated_delivery_date
+        data_type: TIMESTAMP
+        description: Delivery date promised to the customer at purchase time.
+        synonyms: [promised date, estimated delivery]
+    metrics:
+      - name: order_count
+        expr: COUNT(DISTINCT orders.order_id)
+        description: Number of orders.
+        synonyms: [number of orders, total orders]
+      - name: avg_delivery_days
+        expr: AVG(EXTRACT(EPOCH FROM (orders.order_delivered_customer_date - orders.order_purchase_timestamp)) / 86400.0)
+        description: Average days from purchase to delivery. Only meaningful for delivered orders.
+        synonyms: [delivery time, shipping time]
+      - name: late_delivery_rate
+        expr: AVG(CASE WHEN orders.order_delivered_customer_date > orders.order_estimated_delivery_date THEN 1.0 ELSE 0.0 END)
+        description: Share of delivered orders that arrived after the promised date (0-1).
+        synonyms: [late rate, delay rate]
+    filters:
+      - name: delivered_orders
+        expr: orders.order_status = 'delivered'
+        description: Orders that reached the customer.
+        synonyms: [completed orders, fulfilled orders]
+
+  # ---------------------------------------------------------------------------
+  - name: customers
+    description: One row per customer_id (i.e. per order). Holds the delivery location.
+    synonyms: [buyers, clients]
+    base_table: {database: olist, schema: public, table: customers}
+    primary_key: {columns: [customer_id]}
+    dimensions:
+      - name: customer_id
+        expr: customer_id
+        data_type: TEXT
+        description: Per-order customer key; joins to orders.customer_id.
+      - name: customer_unique_id
+        expr: customer_unique_id
+        data_type: TEXT
+        description: The real person. Use this to count unique or repeat customers.
+        synonyms: [unique customer]
+      - name: customer_zip_code_prefix
+        expr: customer_zip_code_prefix
+        data_type: TEXT
+        description: First 5 digits of the customer's zip code.
+      - name: customer_city
+        expr: customer_city
+        data_type: TEXT
+        description: Customer city, lowercase, without accents.
+        synonyms: [buyer city]
+        sample_values: [sao paulo, rio de janeiro, belo horizonte, brasilia, curitiba, campinas, porto alegre, salvador]
+      - name: customer_state
+        expr: customer_state
+        data_type: TEXT
+        description: Two-letter Brazilian state code (SP = Sao Paulo, RJ = Rio de Janeiro, MG = Minas Gerais).
+        synonyms: [buyer state, region]
+        sample_values: [SP, RJ, MG, RS, PR, SC, BA, DF, ES, GO, PE, CE, PA, MT, MA, MS, PB, PI, RN, AL, SE, TO, RO, AM, AC, AP, RR]
+        is_enum: true
+    metrics:
+      - name: unique_customer_count
+        expr: COUNT(DISTINCT customers.customer_unique_id)
+        description: Number of distinct real customers.
+        synonyms: [number of customers, customer count]
+
+  # ---------------------------------------------------------------------------
+  - name: order_items
+    description: >
+      One row per item in an order. An order with 3 units of a product has 3 rows
+      (order_item_id 1, 2, 3). Source of product, seller and price information.
+    synonyms: [line items, order lines]
+    base_table: {database: olist, schema: public, table: order_items}
+    primary_key: {columns: [order_id, order_item_id]}
+    dimensions:
+      - name: order_id
+        expr: order_id
+        data_type: TEXT
+      - name: order_item_id
+        expr: order_item_id
+        data_type: INTEGER
+        description: Sequence number of the item within the order (1, 2, 3...).
+      - name: product_id
+        expr: product_id
+        data_type: TEXT
+      - name: seller_id
+        expr: seller_id
+        data_type: TEXT
+    time_dimensions:
+      - name: shipping_limit_date
+        expr: shipping_limit_date
+        data_type: TIMESTAMP
+        description: Deadline for the seller to hand the item to the carrier.
+    facts:
+      - name: price
+        expr: price
+        data_type: NUMERIC
+        description: Item price in BRL, excluding freight.
+        synonyms: [item price, unit price]
+      - name: freight_value
+        expr: freight_value
+        data_type: NUMERIC
+        description: Shipping cost charged for this item, in BRL.
+        synonyms: [shipping cost, freight]
+    metrics:
+      - name: gmv
+        expr: SUM(order_items.price)
+        description: Gross merchandise value - total item sales in BRL, excluding freight.
+        synonyms: [revenue, sales, gross merchandise value, turnover]
+      - name: total_freight
+        expr: SUM(order_items.freight_value)
+        description: Total freight charged in BRL.
+      - name: items_sold
+        expr: COUNT(*)
+        description: Number of items sold (each row is one unit).
+        synonyms: [units sold, quantity sold]
+
+  # ---------------------------------------------------------------------------
+  - name: order_payments
+    description: >
+      One row per payment used for an order. An order can be paid with several
+      methods (e.g. credit card + voucher), so an order may have several rows.
+    synonyms: [payments, transactions]
+    base_table: {database: olist, schema: public, table: order_payments}
+    primary_key: {columns: [order_id, payment_sequential]}
+    dimensions:
+      - name: order_id
+        expr: order_id
+        data_type: TEXT
+      - name: payment_sequential
+        expr: payment_sequential
+        data_type: INTEGER
+        description: Sequence number when an order uses more than one payment.
+      - name: payment_type
+        expr: payment_type
+        data_type: TEXT
+        description: Payment method. "boleto" is a Brazilian bank slip paid in cash or online.
+        synonyms: [payment method, how paid]
+        sample_values: [credit_card, boleto, voucher, debit_card, not_defined]
+        is_enum: true
+    facts:
+      - name: payment_installments
+        expr: payment_installments
+        data_type: INTEGER
+        description: Number of monthly installments chosen by the customer.
+        synonyms: [installments]
+      - name: payment_value
+        expr: payment_value
+        data_type: NUMERIC
+        description: Amount paid with this payment, in BRL (includes freight).
+        synonyms: [amount paid]
+    metrics:
+      - name: total_payment_value
+        expr: SUM(order_payments.payment_value)
+        description: Total amount paid by customers in BRL, including freight.
+        synonyms: [total paid, payment total]
+
+  # ---------------------------------------------------------------------------
+  - name: order_reviews
+    description: Customer satisfaction survey sent after delivery. Usually one review per order.
+    synonyms: [reviews, ratings, feedback]
+    base_table: {database: olist, schema: public, table: order_reviews}
+    primary_key: {columns: [review_id, order_id]}
+    dimensions:
+      - name: review_id
+        expr: review_id
+        data_type: TEXT
+      - name: order_id
+        expr: order_id
+        data_type: TEXT
+      - name: review_comment_title
+        expr: review_comment_title
+        data_type: TEXT
+        description: Optional title written by the customer, in Portuguese.
+      - name: review_comment_message
+        expr: review_comment_message
+        data_type: TEXT
+        description: Optional free-text comment, in Portuguese.
+    time_dimensions:
+      - name: review_creation_date
+        expr: review_creation_date
+        data_type: TIMESTAMP
+        description: When the survey was sent to the customer.
+      - name: review_answer_timestamp
+        expr: review_answer_timestamp
+        data_type: TIMESTAMP
+        description: When the customer answered the survey.
+    facts:
+      - name: review_score
+        expr: review_score
+        data_type: INTEGER
+        description: Rating from 1 (worst) to 5 (best).
+        synonyms: [rating, stars, satisfaction score]
+        sample_values: ['1', '2', '3', '4', '5']
+    metrics:
+      - name: avg_review_score
+        expr: AVG(order_reviews.review_score)
+        description: Average rating, 1-5.
+        synonyms: [average rating, customer satisfaction]
+    filters:
+      - name: negative_reviews
+        expr: order_reviews.review_score <= 2
+        description: Reviews with 1 or 2 stars.
+        synonyms: [bad reviews, poor ratings]
+
+  # ---------------------------------------------------------------------------
+  - name: products
+    description: One row per product. Category names are in Portuguese; join product_categories for English.
+    synonyms: [items catalog, catalog]
+    base_table: {database: olist, schema: public, table: products}
+    primary_key: {columns: [product_id]}
+    dimensions:
+      - name: product_id
+        expr: product_id
+        data_type: TEXT
+      - name: product_category_name
+        expr: product_category_name
+        data_type: TEXT
+        description: Category in Portuguese. Prefer product_category_name_english for display.
+        sample_values: [cama_mesa_banho, beleza_saude, esporte_lazer, moveis_decoracao, informatica_acessorios]
+    facts:
+      - name: product_weight_g
+        expr: product_weight_g
+        data_type: NUMERIC
+        description: Weight in grams.
+        synonyms: [weight]
+      - name: product_length_cm
+        expr: product_length_cm
+        data_type: NUMERIC
+      - name: product_height_cm
+        expr: product_height_cm
+        data_type: NUMERIC
+      - name: product_width_cm
+        expr: product_width_cm
+        data_type: NUMERIC
+
+  # ---------------------------------------------------------------------------
+  - name: product_categories
+    description: Translation of Portuguese category names to English.
+    synonyms: [categories, category translation]
+    base_table: {database: olist, schema: public, table: product_categories}
+    primary_key: {columns: [product_category_name]}
+    dimensions:
+      - name: product_category_name
+        expr: product_category_name
+        data_type: TEXT
+      - name: product_category_name_english
+        expr: product_category_name_english
+        data_type: TEXT
+        description: Category name in English. Use this in answers.
+        synonyms: [category, product category, product type]
+        sample_values: [bed_bath_table, health_beauty, sports_leisure, furniture_decor,
+                        computers_accessories, housewares, watches_gifts, telephony,
+                        garden_tools, auto, toys, cool_stuff, perfumery, baby, electronics]
+
+  # ---------------------------------------------------------------------------
+  - name: sellers
+    description: One row per seller (merchant) on the marketplace.
+    synonyms: [merchants, vendors, shops]
+    base_table: {database: olist, schema: public, table: sellers}
+    primary_key: {columns: [seller_id]}
+    dimensions:
+      - name: seller_id
+        expr: seller_id
+        data_type: TEXT
+      - name: seller_zip_code_prefix
+        expr: seller_zip_code_prefix
+        data_type: TEXT
+      - name: seller_city
+        expr: seller_city
+        data_type: TEXT
+        description: Seller city, lowercase, without accents.
+        synonyms: [merchant city]
+        sample_values: [sao paulo, curitiba, rio de janeiro, belo horizonte, ribeirao preto]
+      - name: seller_state
+        expr: seller_state
+        data_type: TEXT
+        description: Two-letter Brazilian state code of the seller.
+        synonyms: [merchant state]
+        sample_values: [SP, PR, MG, SC, RJ, RS, GO, DF, ES, BA]
+    metrics:
+      - name: seller_count
+        expr: COUNT(DISTINCT sellers.seller_id)
+        description: Number of distinct sellers.
+        synonyms: [number of sellers]
+
+# =============================================================================
+# Relationships: left_table holds the foreign key, right_table is referenced.
+# =============================================================================
+relationships:
+  - name: orders_to_customers
+    left_table: orders
+    right_table: customers
+    relationship_columns: [{left_column: customer_id, right_column: customer_id}]
+  - name: order_items_to_orders
+    left_table: order_items
+    right_table: orders
+    relationship_columns: [{left_column: order_id, right_column: order_id}]
+  - name: order_items_to_products
+    left_table: order_items
+    right_table: products
+    relationship_columns: [{left_column: product_id, right_column: product_id}]
+  - name: order_items_to_sellers
+    left_table: order_items
+    right_table: sellers
+    relationship_columns: [{left_column: seller_id, right_column: seller_id}]
+  - name: order_payments_to_orders
+    left_table: order_payments
+    right_table: orders
+    relationship_columns: [{left_column: order_id, right_column: order_id}]
+  - name: order_reviews_to_orders
+    left_table: order_reviews
+    right_table: orders
+    relationship_columns: [{left_column: order_id, right_column: order_id}]
+  - name: products_to_categories
+    left_table: products
+    right_table: product_categories
+    relationship_columns: [{left_column: product_category_name, right_column: product_category_name}]
+
+# =============================================================================
+# Custom instructions (same two modules as Cortex Analyst)
+# =============================================================================
+module_custom_instructions:
+  sql_generation: |
+    - Write PostgreSQL. Use only the tables and columns defined in this semantic view.
+    - "Revenue", "sales" or "GMV" means SUM(order_items.price) unless the user says "including freight" or "amount paid".
+    - Never aggregate order_items and order_payments in the same SELECT after joining both to orders:
+      both have several rows per order, so the join multiplies rows and inflates totals.
+      Aggregate each one in its own CTE by order_id first, then join.
+    - Count customers with COUNT(DISTINCT customers.customer_unique_id), never customer_id.
+    - Use order_purchase_timestamp for "when" questions unless the question is about delivery or reviews.
+    - Data runs from 2016-09 to 2018-10; 2016 and late 2018 are incomplete. If no year is given for a trend, use 2017.
+    - Show product categories with product_categories.product_category_name_english.
+    - Round money to 2 decimals and rates to 4 decimals. Add LIMIT 100 unless the question asks for everything.
+  question_categorization: |
+    - Reject questions about individual customers' personal data (names, emails, phone numbers); this data is not stored.
+    - Reject questions about profit, margins or costs other than freight; Olist cost data is not in this dataset.
+    - If the user asks about "performance" or "best" without a metric, ask whether they mean GMV, number of orders or review score.
+    - If the user asks about "customers" by location, use the delivery location (customer_state / customer_city).
+
+# =============================================================================
+# Verified queries: known-good question -> SQL pairs used as few-shot examples.
+# Keep these OUT of your evaluation set (eval/questions.jsonl), or the eval
+# score will be inflated.
+# =============================================================================
+verified_queries:
+  - name: monthly_orders_2017
+    question: How many orders were placed each month in 2017?
+    use_as_onboarding_question: true
+    verified_by: sainath
+    sql: |
+      SELECT DATE_TRUNC('month', o.order_purchase_timestamp) AS order_month,
+             COUNT(DISTINCT o.order_id) AS order_count
+      FROM orders AS o
+      WHERE o.order_purchase_timestamp >= '2017-01-01'
+        AND o.order_purchase_timestamp <  '2018-01-01'
+      GROUP BY order_month
+      ORDER BY order_month
+
+  - name: top_categories_by_gmv
+    question: What are the top 10 product categories by revenue?
+    use_as_onboarding_question: true
+    verified_by: sainath
+    sql: |
+      SELECT pc.product_category_name_english AS category,
+             ROUND(SUM(oi.price)::numeric, 2) AS gmv
+      FROM order_items AS oi
+      JOIN products AS p ON oi.product_id = p.product_id
+      JOIN product_categories AS pc ON p.product_category_name = pc.product_category_name
+      GROUP BY pc.product_category_name_english
+      ORDER BY gmv DESC
+      LIMIT 10
+
+  - name: avg_review_by_state
+    question: What is the average review score by customer state?
+    use_as_onboarding_question: true
+    verified_by: sainath
+    sql: |
+      SELECT c.customer_state,
+             ROUND(AVG(r.review_score)::numeric, 2) AS avg_review_score,
+             COUNT(*) AS review_count
+      FROM order_reviews AS r
+      JOIN orders AS o ON r.order_id = o.order_id
+      JOIN customers AS c ON o.customer_id = c.customer_id
+      GROUP BY c.customer_state
+      ORDER BY avg_review_score DESC
+
+  - name: payment_type_share
+    question: What share of the total amount paid comes from each payment type?
+    verified_by: sainath
+    sql: |
+      SELECT op.payment_type,
+             ROUND(SUM(op.payment_value)::numeric, 2) AS total_paid,
+             ROUND((SUM(op.payment_value) / SUM(SUM(op.payment_value)) OVER ())::numeric, 4) AS share
+      FROM order_payments AS op
+      GROUP BY op.payment_type
+      ORDER BY total_paid DESC
+
+  - name: delivery_days_by_state
+    question: What is the average delivery time in days for each customer state?
+    verified_by: sainath
+    sql: |
+      SELECT c.customer_state,
+             ROUND(AVG(EXTRACT(EPOCH FROM (o.order_delivered_customer_date
+                                         - o.order_purchase_timestamp)) / 86400.0)::numeric, 2) AS avg_delivery_days
+      FROM orders AS o
+      JOIN customers AS c ON o.customer_id = c.customer_id
+      WHERE o.order_status = 'delivered'
+        AND o.order_delivered_customer_date IS NOT NULL
+      GROUP BY c.customer_state
+      ORDER BY avg_delivery_days DESC
+
+  - name: late_delivery_impact_on_reviews
+    question: Do late deliveries get lower review scores than on-time deliveries?
+    verified_by: sainath
+    sql: |
+      SELECT CASE WHEN o.order_delivered_customer_date > o.order_estimated_delivery_date
+                  THEN 'late' ELSE 'on_time' END AS delivery_status,
+             ROUND(AVG(r.review_score)::numeric, 2) AS avg_review_score,
+             COUNT(DISTINCT o.order_id) AS order_count
+      FROM orders AS o
+      JOIN order_reviews AS r ON r.order_id = o.order_id
+      WHERE o.order_status = 'delivered'
+        AND o.order_delivered_customer_date IS NOT NULL
+      GROUP BY delivery_status
+
+  - name: gmv_and_payments_per_month
+    question: Show GMV and total amount paid per month in 2018.
+    verified_by: sainath
+    sql: |
+      WITH items AS (
+        SELECT order_id, SUM(price) AS gmv
+        FROM order_items
+        GROUP BY order_id
+      ),
+      payments AS (
+        SELECT order_id, SUM(payment_value) AS paid
+        FROM order_payments
+        GROUP BY order_id
+      )
+      SELECT DATE_TRUNC('month', o.order_purchase_timestamp) AS order_month,
+             ROUND(SUM(i.gmv)::numeric, 2) AS gmv,
+             ROUND(SUM(p.paid)::numeric, 2) AS total_paid
+      FROM orders AS o
+      LEFT JOIN items AS i ON i.order_id = o.order_id
+      LEFT JOIN payments AS p ON p.order_id = o.order_id
+      WHERE o.order_purchase_timestamp >= '2018-01-01'
+        AND o.order_purchase_timestamp <  '2019-01-01'
+      GROUP BY order_month
+      ORDER BY order_month
+
+  - name: repeat_customers
+    question: How many customers placed more than one order?
+    verified_by: sainath
+    sql: |
+      SELECT COUNT(*) AS repeat_customers
+      FROM (
+        SELECT c.customer_unique_id
+        FROM customers AS c
+        JOIN orders AS o ON o.customer_id = c.customer_id
+        GROUP BY c.customer_unique_id
+        HAVING COUNT(DISTINCT o.order_id) > 1
+      ) AS t
